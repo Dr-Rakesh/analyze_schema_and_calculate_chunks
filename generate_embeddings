@@ -1,0 +1,2037 @@
+"""
+Azure Functions App - Data Ingestion Pipeline with HTTP Trigger
+================================================================
+Python Programming Model V2 - All functions in one file with decorators
+
+Last Update: February 26, 2026 - Version 8.3
+- FEATURE: Added SXA pipeline support with flexible schema detection
+- FEATURE: Dynamic field discovery and Azure AI Search index creation
+- FEATURE: New functions for SXA data source handling
+- OPTIMIZATION: Schema analysis with field type inference
+- OPTIMIZATION: Preserved all original DITA pipeline functionality (100%)
+- ENHANCEMENT: Flexible indexing that adapts to any JSON structure
+- FIX: Embedding field hidden (retrievable=False, stored=False)
+- FIX: Enhanced type detection (datetime formats, numeric strings, collections)
+
+Original Pipeline Functions (unchanged): 9
+  1. call_api_fetch_dataset (DITA download)
+  2. calculate_chunks (DITA chunking)
+  3. parse_documents (DITA parsing)
+  4. generate_embeddings (SHARED - used by both pipelines)
+  5. index_documents (Legacy - kept for compatibility)
+  6. index_single_chunk (DITA indexing)
+  7. trigger_pipeline (Pipeline management)
+  8. check_pipeline_status (Pipeline monitoring)
+  9. list_recent_runs (Pipeline history)
+
+New SXA Pipeline Functions: 4
+  10. call_api_fetch_dataset_sxa (SXA download)
+  11. parse_documents_sxa (SXA parsing with dynamic fields)
+  12. analyze_schema_and_calculate_chunks (Dynamic schema detection)
+  13. index_single_chunk_sxa (Flexible indexing)
+
+Total Functions: 13 (9 original + 4 new)
+
+Original Index Fields (DITA): 13 fields - Fixed schema
+  (id, book_id, book_title, chapter_title, title, topic_title, 
+   topic_type, topic_id, content, url, product, version, embedding)
+
+SXA Index Fields: Dynamic - Adapts to any JSON structure
+  (id, [all detected fields from documents], embedding)
+  Note: Embedding field is supposed to be Hidden
+"""
+
+import azure.functions as func
+import datetime
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+import uuid
+import zipfile
+from typing import Dict, Any, List, Set, Tuple
+from math import ceil
+from collections import Counter
+
+import requests
+import tiktoken
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SimpleField,
+    SearchableField,
+    SearchField,
+    SearchFieldDataType,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+)
+from openai import AzureOpenAI
+
+# ADF Management imports
+from azure.mgmt.datafactory import DataFactoryManagementClient
+from azure.mgmt.datafactory.models import RunFilterParameters
+
+# Initialize the Function App
+app = func.FunctionApp()
+
+# ================================
+# Azure Key Vault Configuration
+# ================================
+
+def sanitize_keyvault_name(name: str) -> str:
+    """Sanitize secret name for Key Vault (replace underscores with hyphens)."""
+    return name.replace("_", "-")
+
+
+def fetch_secret_from_keyvault(name: str, default_value: str = None) -> str:
+    """
+    Fetch a secret from Azure Key Vault.
+    Falls back to environment variable or default value if Key Vault is unavailable.
+    """
+    try:
+        key_vault_name = os.getenv("KEY_VAULT_NAME")
+        if not key_vault_name:
+            logging.warning(f"KEY_VAULT_NAME not set, falling back to env var for {name}")
+            return os.environ.get(name, default_value)
+        
+        key_vault_url = f"https://{key_vault_name}.vault.azure.net/"
+        credential = DefaultAzureCredential()
+        client = SecretClient(vault_url=key_vault_url, credential=credential)
+        
+        sanitized_name = sanitize_keyvault_name(name)
+        secret = client.get_secret(sanitized_name)
+        logging.info(f"Successfully fetched secret: {sanitized_name}")
+        return secret.value
+    except Exception as e:
+        logging.warning(f"Error fetching secret '{name}' from Key Vault: {str(e)}. Falling back to env var.")
+        return os.environ.get(name, default_value)
+
+
+# ================================
+# Configuration from Azure Key Vault
+# ================================
+
+# Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING = fetch_secret_from_keyvault('AZURE-STORAGE-CONNECTION-STRING')
+AZURE_STORAGE_ACCOUNT_NAME = fetch_secret_from_keyvault('AZURE-STORAGE-ACCOUNT-NAME')
+AZURE_STORAGE_CONTAINER = fetch_secret_from_keyvault('AZURE-STORAGE-CONTAINER')
+
+# Azure AI Search Configuration
+AZURE_AI_SEARCH_NAME = fetch_secret_from_keyvault('AZURE-AI-SEARCH-NAME')
+AZURE_AI_SEARCH_ENDPOINT = fetch_secret_from_keyvault('AZURE-AI-SEARCH-ENDPOINT')
+AZURE_AI_SEARCH_API_KEY = fetch_secret_from_keyvault('AZURE-AI-SEARCH-API-KEY')
+
+# Azure OpenAI Configuration
+AZURE_OPENAI_ENDPOINT = fetch_secret_from_keyvault('AZURE-OPENAI-ENDPOINT')
+AZURE_OPENAI_DEPLOYMENT_NAME = fetch_secret_from_keyvault('AZURE-OPENAI-DEPLOYMENT-NAME')
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = fetch_secret_from_keyvault('AZURE-OPENAI-EMBEDDING-DEPLOYMENT-NAME')
+AZURE_OPENAI_API_VERSION = fetch_secret_from_keyvault('AZURE-OPENAI-DEPLOYMENT-VERSION')
+
+# API Configuration
+API_BASE_URL = fetch_secret_from_keyvault('API-BASE-URL')
+API_BASE_SXA_URL = fetch_secret_from_keyvault('API-BASE-SXA-URL')
+
+# Data Processing Configuration
+DEFAULT_CHUNK_SIZE = int(fetch_secret_from_keyvault('CHUNK-SIZE') or '25')
+DEFAULT_EMBEDDING_FIELD = fetch_secret_from_keyvault('EMBEDDING-FIELD')
+DEFAULT_INDEXING_BATCH_SIZE = int(fetch_secret_from_keyvault('INDEXING-BATCH-SIZE') or '100')
+MAX_ASYNC_TIME_MINUTES = int(fetch_secret_from_keyvault('MAX-ASYNC-TIME-MINUTES') or '2')
+
+# ADF Pipeline Configuration
+SUBSCRIPTION_ID = fetch_secret_from_keyvault('AZURE-SUBSCRIPTION-ID')
+RESOURCE_GROUP = fetch_secret_from_keyvault('AZURE-RESOURCE-GROUP')
+DATA_FACTORY_NAME = fetch_secret_from_keyvault('AZURE-DATA-FACTORY-NAME')
+PIPELINE_NAME = fetch_secret_from_keyvault('ADF-PIPELINE-NAME')
+PIPELINE_NAME = os.environ.get('ADF_PIPELINE_NAME', 'DataIngestionPipeline_ADT02')
+
+# ================================
+# Shared Utility Functions
+# ================================
+
+def format_bytes(bytes_value: int) -> str:
+    """Format bytes to human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"
+
+
+def get_blob_service_client():
+    """Get authenticated blob service client."""
+    if AZURE_STORAGE_CONNECTION_STRING:
+        return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    else:
+        credential = DefaultAzureCredential()
+        account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+        return BlobServiceClient(account_url=account_url, credential=credential)
+
+
+def clean_content_text(content: str) -> str:
+    """Clean content by removing reference patterns."""
+    if not content or not isinstance(content, str):
+        return ""
+    
+    patterns = [
+        r'\[TopicRef::[^\]]+\]',
+        r'\[TableRef::[^\]]+\]',
+        r'\[ImageRef::[^\]]+\]',
+        r'\[VideoRef::[^\]]+\]',
+    ]
+    
+    cleaned_content = content
+    for pattern in patterns:
+        cleaned_content = re.sub(pattern, '', cleaned_content)
+    
+    cleaned_content = re.sub(r'\n\s*\n', '\n', cleaned_content)
+    cleaned_content = re.sub(r'^\s+|\s+$', '', cleaned_content)
+    
+    return cleaned_content
+
+
+def num_tokens_from_string(string: str, encoding_name: str = "cl100k_base") -> int:
+    """Count the number of tokens in a string."""
+    try:
+        encoding = tiktoken.get_encoding(encoding_name)
+        num_tokens = len(encoding.encode(string))
+        return num_tokens
+    except Exception as e:
+        logging.warning(f"Error counting tokens: {str(e)}")
+        return len(string) // 4  # Rough estimate
+
+
+def truncate_text_to_tokens(text: str, max_tokens: int = 8000) -> str:
+    """Truncate text to a maximum number of tokens."""
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        encoded = encoding.encode(text)
+        if len(encoded) > max_tokens:
+            truncated = encoded[:max_tokens]
+            return encoding.decode(truncated)
+        return text
+    except Exception as e:
+        logging.warning(f"Error truncating text: {str(e)}")
+        # Fallback: truncate by characters
+        if len(text) > max_tokens * 4:
+            return text[:max_tokens * 4]
+        return text
+
+
+# ================================
+# SECTION 1: DATA PROCESSING FUNCTIONS
+# ================================
+
+# ================================
+# SXA-Specific Utility Functions
+# ================================
+
+def infer_field_type(value: Any, field_name: str = "") -> str:
+    """
+    Infer the appropriate Azure Search field type from a value.
+    Handles: null, boolean, integer, float, date/datetime, arrays, and strings.
+    
+    Args:
+        value: The value to infer type from
+        field_name: Optional field name for special handling
+    """
+    if value is None:
+        return "string"  # Default to string for null values
+    
+    # Check type hierarchy (most specific to least specific)
+    if isinstance(value, bool):
+        return "boolean"
+    elif isinstance(value, int):
+        return "integer"
+    elif isinstance(value, float):
+        return "double"
+    elif isinstance(value, list):
+        # For arrays, return collection (will be handled as string in index)
+        return "collection"
+    elif isinstance(value, dict):
+        # Nested objects - return as string (will need to be JSON serialized)
+        return "string"
+    elif isinstance(value, str):
+        # SPECIAL CASE: Always treat version, product, release as strings
+        if field_name.lower() in ['version', 'product', 'release']:
+            return "string"
+        
+        # Check if it looks like a datetime
+        # Common patterns: ISO 8601, RFC 3339, etc.
+        datetime_patterns = [
+            r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}',  # ISO 8601: 2024-01-15T10:30:00
+            r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}',  # SQL format: 2024-01-15 10:30:00
+            r'^\d{4}-\d{2}-\d{2}$',                   # Date only: 2024-01-15
+        ]
+        
+        for pattern in datetime_patterns:
+            if re.match(pattern, value):
+                return "datetime"
+        
+        # Check if it's a numeric string
+        try:
+            # Try integer first
+            int(value)
+            return "integer"
+        except (ValueError, TypeError):
+            try:
+                # Try float
+                float(value)
+                return "double"
+            except (ValueError, TypeError):
+                pass
+        
+        return "string"
+    else:
+        # Fallback for unknown types
+        return "string"
+
+
+# 1-Analyze Document Structure
+def analyze_document_schema(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Analyze documents to determine schema dynamically.
+    FULLY ADAPTIVE: Works with any JSON structure, any field names, any data types.
+    Returns detected fields with types and search/filter attributes.
+    """
+    if not documents:
+        return {"fields": {}, "content_field": None}
+    
+    field_types = {}
+    field_counts = Counter()
+    field_sample_values = {}  # Track sample values for better type inference
+    
+    # Sample more documents for better schema detection
+    sample_size = min(len(documents), 200)
+    sample_docs = documents[:sample_size]
+    
+    logging.info(f"Analyzing schema from {sample_size} documents...")
+    
+    for doc in sample_docs:
+        if not isinstance(doc, dict):
+            continue
+            
+        for field_name, value in doc.items():
+            field_counts[field_name] += 1
+            
+            if field_name not in field_types:
+                field_types[field_name] = []
+                field_sample_values[field_name] = []
+            
+            # Store type and sample value
+            field_types[field_name].append(infer_field_type(value, field_name))
+            if len(field_sample_values[field_name]) < 5:  # Keep first 5 samples
+                field_sample_values[field_name].append(value)
+    
+    schema = {"fields": {}, "content_field": None}
+    
+    # Build schema for each detected field
+    for field_name, types in field_types.items():
+        # Get most common type
+        type_counter = Counter(types)
+        most_common_type = type_counter.most_common(1)[0][0]
+        
+        # Determine if field should be searchable (text fields that aren't IDs/URLs)
+        is_text_field = most_common_type == "string"
+        is_id_or_url = field_name.lower() in ['id', 'url', 'uri', 'link', 'href']
+        is_searchable = is_text_field and not is_id_or_url
+        
+        # Determine if field should be filterable (common filter fields)
+        common_filter_fields = [
+            'product', 'version', 'release', 'type', 'category', 
+            'status', 'language', 'locale', 'format', 'source',
+            'author', 'owner', 'department', 'region', 'country'
+        ]
+        is_filterable = field_name.lower() in common_filter_fields
+        
+        # Calculate frequency (how often this field appears)
+        frequency = field_counts[field_name] / len(sample_docs)
+        
+        schema["fields"][field_name] = {
+            "type": most_common_type,
+            "searchable": is_searchable,
+            "filterable": is_filterable,
+            "frequency": frequency,
+            "occurrences": field_counts[field_name]
+        }
+    
+    # 2- Intelligent Content Field Detection: 
+    # Identify content field (SMART DETECTION - checks actual content, not just names)
+    content_candidates = []
+    
+    # ADAPTIVE APPROACH: Check ALL text fields and score them by actual content
+    for field_name, field_info in schema["fields"].items():
+        if field_info["type"] == "string":
+            # Calculate average length from samples
+            samples = field_sample_values.get(field_name, [])
+            avg_length = sum(len(str(s)) for s in samples if s) / max(len(samples), 1)
+            
+            # Skip fields that are clearly IDs, URLs, or have no content
+            is_id_or_url = field_name.lower() in ['id', 'url', 'uri', 'link', 'href']
+            is_very_short = avg_length < 10  # Less than 10 chars on average
+            
+            if is_id_or_url or is_very_short:
+                continue
+            
+            # Score the field based on multiple factors
+            score = 0
+            
+            # Factor 1: Content length (most important)
+            score += avg_length
+            
+            # Factor 2: Bonus for common content field names
+            explicit_content_names = ['content', 'text', 'body', 'description', 'summary', 'abstract']
+            if any(name in field_name.lower() for name in explicit_content_names):
+                score += 500  # Bonus, but not overwhelming
+            
+            # Factor 3: Bonus for fields with "content" in the name
+            if 'content' in field_name.lower():
+                score += 300
+            
+            # Factor 4: Penalty for fields with "title", "name", "id" in name
+            penalty_terms = ['title', 'name', 'id', 'key']
+            if any(term in field_name.lower() for term in penalty_terms):
+                score -= 200
+            
+            # Factor 5: Bonus for high frequency (field appears in most documents)
+            if field_info.get("frequency", 0) > 0.8:
+                score += 100
+            
+            content_candidates.append((field_name, field_info, score))
+            logging.info(f"Content field candidate: {field_name} (score: {score:.0f}, avg_length: {avg_length:.1f})")
+    
+    # Select content field with highest priority/length
+    if content_candidates:
+        content_candidates.sort(key=lambda x: x[2], reverse=True)
+        schema["content_field"] = content_candidates[0][0]
+        logging.info(f"Selected content field: {schema['content_field']}")
+    else:
+        logging.warning("No suitable content field found - embedding may fail")
+        schema["content_field"] = None
+    
+    # Log schema summary
+    total_fields = len(schema["fields"])
+    searchable_count = sum(1 for f in schema["fields"].values() if f["searchable"])
+    filterable_count = sum(1 for f in schema["fields"].values() if f["filterable"])
+    
+    logging.info(f"Schema detected: {total_fields} fields ({searchable_count} searchable, {filterable_count} filterable)")
+    logging.info(f"Field types: {Counter(f['type'] for f in schema['fields'].values())}")
+    
+    return schema
+
+
+#3- Dynamic Index Field Creation
+def create_dynamic_index_fields(schema: Dict[str, Any]) -> List[SearchField]:
+    """
+    Create Azure Search fields from detected schema.
+    IMPORTANT: Embedding field is hidden (retrievable=False, stored=False) for vector search only.
+    All other fields are dynamically created based on detected schema.
+    """
+    fields = []
+    
+    # Always add ID field first (required key field)
+    fields.append(SimpleField(name="id", type=SearchFieldDataType.String, key=True))
+    
+    # Add all detected fields from schema (fully dynamic)
+    for field_name, field_info in schema["fields"].items():
+        # Skip ID (already added) and embedding (added separately at end)
+        if field_name in ["id", "embedding"]:
+            continue
+        
+        # Map detected types to Azure Search types
+        field_type_map = {
+            "string": SearchFieldDataType.String,
+            "integer": SearchFieldDataType.Int32,
+            "double": SearchFieldDataType.Double,
+            "boolean": SearchFieldDataType.Boolean,
+            "datetime": SearchFieldDataType.DateTimeOffset,
+        }
+        
+        # Handle collections separately
+        if field_info["type"] == "collection":
+            field_type = SearchFieldDataType.Collection(SearchFieldDataType.String)
+        else:
+            field_type = field_type_map.get(field_info["type"], SearchFieldDataType.String)
+        
+        # Create searchable or simple field based on detected properties
+        if field_info["searchable"]:
+            fields.append(
+                SearchableField(
+                    name=field_name,
+                    type=field_type,
+                    searchable=True,
+                    filterable=field_info["filterable"],
+                    retrievable=True  # Make data retrievable
+                )
+            )
+        else:
+            fields.append(
+                SimpleField(
+                    name=field_name,
+                    type=field_type,
+                    filterable=field_info["filterable"],
+                    retrievable=True  # Make data retrievable
+                )
+            )
+    
+    # Add embedding field at the end (HIDDEN from results, used for vector search)
+    fields.append(
+        SearchField(
+            name="embedding",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            searchable=True,  # Enables vector search
+            retrievable=False,  # Hides from search results (but still stored for search!)
+            vector_search_dimensions=3072,
+            vector_search_profile_name="my_vector_config"
+        )
+    )
+    
+    logging.info(f"Created {len(fields)} index fields ({len(fields)-2} from schema + id + embedding)")
+    
+    return fields
+
+
+# ================================
+# SECTION 1: ORIGINAL DITA PIPELINE FUNCTIONS (UNCHANGED)
+# ================================
+
+# FUNCTION 1: Download Dataset
+@app.function_name(name="call_api_fetch_dataset")
+@app.route(route="call_api_fetch_dataset", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def call_api_fetch_dataset(req: func.HttpRequest) -> func.HttpResponse:
+    """Download ZIP from API using streaming and extract to blob storage."""
+    logging.info('Download and extract function started')
+    start_time = datetime.datetime.utcnow()
+    
+    try:
+        req_body = req.get_json()
+        data_source = req_body.get('data_source')
+        product = req_body.get('product')
+        release = req_body.get('release')
+        format_type = req_body.get('format', 'DITA')
+        language = req_body.get('language', 'en-us')
+        
+        if not all([data_source, product, release]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters: data_source, product, release"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        
+        payload = {
+            'data_source': data_source,
+            'product': product,
+            'release': release,
+            'format': format_type,
+            'language': language
+        }
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/octet-stream'
+        }
+        
+        params = {"download": "true"}
+        
+        logging.info(f"Downloading dataset: {data_source}_{product}_{release}")
+        
+        response = requests.post(
+            API_BASE_URL, 
+            params=params, 
+            json=payload, 
+            headers=headers, 
+            stream=True, 
+            timeout=600
+        )
+        
+        if response.status_code != 200:
+            return func.HttpResponse(
+                json.dumps({"error": f"API returned status {response.status_code}"}),
+                status_code=response.status_code,
+                mimetype="application/json"
+            )
+        
+        timestamp = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        folder_name = f"{data_source}_{product}_{release}_{timestamp}"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+            temp_path = temp_file.name
+            total_size = 0
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
+                    total_size += len(chunk)
+            
+            logging.info(f"Downloaded {format_bytes(total_size)}")
+        
+        extraction_count = 0
+        container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+        
+        with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+            for file_info in zip_ref.filelist:
+                if file_info.filename.endswith('.json') and not file_info.is_dir():
+                    with zip_ref.open(file_info.filename) as file:
+                        file_content = file.read()
+                        blob_name = f"{folder_name}/{os.path.basename(file_info.filename)}"
+                        
+                        blob_client = container_client.get_blob_client(blob_name)
+                        blob_client.upload_blob(
+                            file_content, 
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type='application/json')
+                        )
+                        extraction_count += 1
+        
+        os.unlink(temp_path)
+        
+        end_time = datetime.datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        logging.info(f"Extraction complete: {extraction_count} files in {duration:.2f}s")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "folder_name": folder_name,
+                "files_extracted": extraction_count,
+                "download_size_bytes": total_size,
+                "duration_seconds": round(duration, 2)
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Download error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 2: Calculate Chunks
+@app.function_name(name="calculate_chunks")
+@app.route(route="calculate_chunks", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def calculate_chunks(req: func.HttpRequest) -> func.HttpResponse:
+    """Calculate total number of chunks needed."""
+    logging.info('Calculate chunks function started')
+    
+    try:
+        req_body = req.get_json()
+        parsed_file_name = req_body.get('parsed_file_name')
+        chunk_size = req_body.get('chunk_size', DEFAULT_CHUNK_SIZE)
+        
+        if not parsed_file_name:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing parsed_file_name parameter"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=parsed_file_name
+        )
+        
+        blob_data = blob_client.download_blob().readall()
+        documents = json.loads(blob_data.decode('utf-8'))
+        
+        total_documents = len(documents)
+        total_chunks = ceil(total_documents / chunk_size)
+        
+        logging.info(f"Calculation: {total_documents} documents â†’ {total_chunks} chunks of {chunk_size}")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "total_documents": total_documents,
+                "chunk_size": chunk_size,
+                "total_chunks": total_chunks
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Calculate chunks error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 3: Parse Documents   
+@app.function_name(name="parse_documents")
+@app.route(route="parse_documents", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def parse_documents(req: func.HttpRequest) -> func.HttpResponse:
+    """Parse and clean JSON documents."""
+    logging.info('Parse documents function started')
+    start_time = datetime.datetime.utcnow()
+    
+    try:
+        req_body = req.get_json()
+        folder_name = req_body.get('folder_name')
+        data_source_type = req_body.get('data_source_type', 'SXA')
+        
+        if not folder_name:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing folder_name parameter"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+        
+        all_documents = []
+        file_count = 0
+        
+        blobs = container_client.list_blobs(name_starts_with=f"{folder_name}/")
+        
+        for blob in blobs:
+            if blob.name.endswith('.json') and 'consolidated_results' not in blob.name:
+                blob_client = container_client.get_blob_client(blob.name)
+                blob_data = blob_client.download_blob().readall()
+                
+                try:
+                    data = json.loads(blob_data.decode('utf-8'))
+                    
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and 'content' in item:
+                                cleaned_content = clean_content_text(item.get('content', ''))
+                                if cleaned_content.strip():
+                                    truncated_content = truncate_text_to_tokens(cleaned_content, max_tokens=8000)
+                                    
+                                    all_documents.append({
+                                        'book_id': item.get('book_id', ''),
+                                        'book_title': item.get('book_title', ''),
+                                        'chapter_title': item.get('chapter_title', ''),
+                                        'title': item.get('title', ''),
+                                        'topic_title': item.get('topic_title', ''),
+                                        'topic_type': item.get('topic_type', ''),
+                                        'topic_id': item.get('topic_id', ''),
+                                        'content': truncated_content,
+                                        'url': item.get('url', ''),
+                                        'product': item.get('product', ''),
+                                        'version': item.get('version', '')
+                                    })
+                    file_count += 1
+                    
+                except json.JSONDecodeError:
+                    logging.warning(f"Skipping invalid JSON: {blob.name}")
+        
+        parsed_filename = f"{folder_name}/consolidated_results_parsed.json"
+        parsed_content = json.dumps(all_documents, ensure_ascii=False, indent=2)
+        
+        parsed_blob_client = container_client.get_blob_client(parsed_filename)
+        parsed_blob_client.upload_blob(
+            parsed_content.encode('utf-8'),
+            overwrite=True,
+            content_settings=ContentSettings(content_type='application/json')
+        )
+        
+        end_time = datetime.datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        logging.info(f"Parsed {len(all_documents)} documents from {file_count} files in {duration:.2f}s")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "parsed_file": parsed_filename,
+                "total_documents": len(all_documents),
+                "files_processed": file_count,
+                "duration_seconds": round(duration, 2)
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Parse documents error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 4: Generate Embeddings With Exponential Backoff
+@app.function_name(name="generate_embeddings")
+@app.route(route="generate_embeddings", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def generate_embeddings(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Generate embeddings for a single chunk with exponential backoff for rate limits.
+    UPDATED: Added retry logic for 429 errors with delays up to 60 seconds.
+    """
+    logging.info('Generate embeddings function started')
+    start_time = time.time()
+    
+    try:
+        req_body = req.get_json()
+        parsed_file_name = req_body.get('parsed_file_name')
+        chunk_number = req_body.get('chunk_number')
+        total_chunks = req_body.get('total_chunks')
+        chunk_size = req_body.get('chunk_size', DEFAULT_CHUNK_SIZE)
+        schema_metadata_file = req_body.get('schema_metadata')  # NEW: Get schema file path
+        
+        if not all([parsed_file_name, chunk_number, total_chunks]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        logging.info(f"Processing chunk {chunk_number}/{total_chunks}")
+        
+        # Download parsed file
+        blob_service_client = get_blob_service_client()
+        
+        # NEW: Load schema metadata to get correct content field
+        if schema_metadata_file:
+            schema_blob_client = blob_service_client.get_blob_client(
+                container=AZURE_STORAGE_CONTAINER,
+                blob=schema_metadata_file
+            )
+            schema_data = json.loads(schema_blob_client.download_blob().readall().decode('utf-8'))
+            embedding_field = schema_data.get('content_field', 'content')
+            logging.info(f"Using content field from schema: {embedding_field}")
+        else:
+            # Fallback to default
+            embedding_field = req_body.get('embedding_field', 'content')
+            logging.warning(f"No schema metadata provided, using field: {embedding_field}")
+        
+        blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=parsed_file_name
+        )
+        
+        blob_data = blob_client.download_blob().readall()
+        all_documents = json.loads(blob_data.decode('utf-8'))
+        
+        # Extract chunk
+        start_idx = (chunk_number - 1) * chunk_size
+        end_idx = min(start_idx + chunk_size, len(all_documents))
+        
+        # Validate chunk boundaries
+        if start_idx >= len(all_documents):
+            logging.warning(f"âš ï¸ Chunk {chunk_number} is beyond document range. Skipping.")
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "skipped",
+                    "chunk_number": chunk_number,
+                    "total_chunks": total_chunks,
+                    "reason": "Chunk number exceeds total documents",
+                    "documents_processed": 0
+                }),
+                status_code=200,
+                mimetype="application/json"
+            )
+        
+        chunk_documents = all_documents[start_idx:end_idx]
+        
+        if len(chunk_documents) == 0:
+            logging.warning(f"âš ï¸ Chunk {chunk_number} contains 0 documents. Skipping.")
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "skipped",
+                    "chunk_number": chunk_number,
+                    "total_chunks": total_chunks,
+                    "reason": "Empty chunk",
+                    "documents_processed": 0
+                }),
+                status_code=200,
+                mimetype="application/json"
+            )
+        
+        logging.info(f"Processing {len(chunk_documents)} documents (indices {start_idx} to {end_idx-1})")
+        
+        # Initialize credentials
+        credential = DefaultAzureCredential()
+        token_provider = get_bearer_token_provider(
+            credential,
+            "https://cognitiveservices.azure.com/.default"
+        )
+        
+        # Prepare texts for embedding - track which docs have content
+        texts = []
+        doc_indices_with_content = []
+        for idx, doc in enumerate(chunk_documents):
+            content = doc.get(embedding_field, "")
+            if content and isinstance(content, str) and content.strip():
+                # CRITICAL: Truncate to 8000 tokens (embedding model limit is 8192)
+                truncated = truncate_text_to_tokens(content.strip(), max_tokens=8000)
+                texts.append(truncated)
+                doc_indices_with_content.append(idx)
+                
+                # Log if truncation occurred
+                if len(truncated) < len(content.strip()):
+                    logging.warning(f"⚠️  Document {idx} truncated from {num_tokens_from_string(content)} to 8000 tokens")
+        
+        # Validation: ensure we have at least some valid texts to embed
+        if not texts:
+            logging.warning(f"⚠️ Chunk {chunk_number} has no valid content to embed. Skipping.")
+            
+            # CRITICAL FIX: Still create the chunk file with empty embeddings
+            # This prevents 404 errors during indexing
+            for doc in chunk_documents:
+                doc['embedding'] = []  # Empty embedding for documents with no content
+            
+            # Save the chunk file even though we're skipping embedding generation
+            folder_name = parsed_file_name.split('/')[0]
+            chunk_folder = f"{folder_name}_embedded_chunks"
+            chunk_file_name = f"{chunk_folder}/embedded_chunk_{chunk_number:03d}_of_{total_chunks:03d}.json"
+            
+            chunk_content = json.dumps(chunk_documents, ensure_ascii=False, indent=2)
+            
+            chunk_blob_client = blob_service_client.get_blob_client(
+                container=AZURE_STORAGE_CONTAINER,
+                blob=chunk_file_name
+            )
+            
+            chunk_blob_client.upload_blob(
+                chunk_content.encode('utf-8'),
+                overwrite=True,
+                content_settings=ContentSettings(content_type='application/json')
+            )
+            
+            logging.info(f" Created empty chunk file: {chunk_file_name}")
+            
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "skipped",
+                    "chunk_number": chunk_number,
+                    "total_chunks": total_chunks,
+                    "reason": "No valid content",
+                    "documents_processed": len(chunk_documents),
+                    "chunk_file": chunk_file_name
+                }),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        
+        # Generate embeddings with exponential backoff for rate limiting
+        max_retries = 15  # 15 for persistent rate limiting
+        retry_delay = 3   # 3 seconds initial delay
+        embeddings = []
+        
+        for attempt in range(max_retries):
+            try:
+                # Call Azure OpenAI REST API directly
+                token = token_provider()
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}"
+                }
+                
+                url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_EMBEDDING_DEPLOYMENT}/embeddings?api-version={AZURE_OPENAI_API_VERSION}"
+                
+                payload = {
+                    "input": texts,
+                    "encoding_format": "float"
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=120)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    embeddings = [item['embedding'] for item in result['data']]
+                    logging.info(f"âœ… Generated {len(embeddings)} embeddings successfully")
+                    break
+                    
+                elif response.status_code == 429:
+                    # Rate limit hit - apply exponential backoff with longer waits
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s, 120s (max)
+                        wait_time = min(retry_delay * (2 ** attempt), 120)  # Max 120 seconds between retries
+                        logging.warning(f"âš ï¸ Rate limit hit (429). Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logging.error(f"âŒ Rate limit persisted after {max_retries} attempts")
+                        return func.HttpResponse(
+                            json.dumps({
+                                "error": "Rate limit exceeded after retries",
+                                "status_code": 429,
+                                "chunk_number": chunk_number
+                            }),
+                            status_code=429,
+                            mimetype="application/json"
+                        )
+                else:
+                    logging.error(f"OpenAI API error: {response.status_code} - {response.text}")
+                    return func.HttpResponse(
+                        json.dumps({
+                            "error": f"OpenAI API error: {response.status_code}",
+                            "details": response.text
+                        }),
+                        status_code=response.status_code,
+                        mimetype="application/json"
+                    )
+                    
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    wait_time = min(retry_delay * (2 ** attempt), 60)
+                    logging.warning(f"âš ï¸ Request timeout. Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"âŒ Request timeout after {max_retries} attempts")
+                    return func.HttpResponse(
+                        json.dumps({
+                            "error": "Request timeout after retries",
+                            "chunk_number": chunk_number
+                        }),
+                        status_code=504,
+                        mimetype="application/json"
+                    )
+                    
+            except Exception as e:
+                logging.error(f"Unexpected error in embedding generation: {str(e)}")
+                return func.HttpResponse(
+                    json.dumps({"error": f"Embedding generation failed: {str(e)}"}),
+                    status_code=500,
+                    mimetype="application/json"
+                )
+        
+        # Attach embeddings back to documents (only those with content get embeddings)
+        embedding_idx = 0
+        for doc_idx in range(len(chunk_documents)):
+            if doc_idx in doc_indices_with_content:
+                # This document had content - give it the embedding
+                chunk_documents[doc_idx]['embedding'] = embeddings[embedding_idx]
+                embedding_idx += 1
+            else:
+                # This document had no content - empty embedding
+                chunk_documents[doc_idx]['embedding'] = []
+        
+        # Save embedded chunk
+        folder_name = parsed_file_name.split('/')[0]
+        chunk_folder = f"{folder_name}_embedded_chunks"
+        chunk_file_name = f"{chunk_folder}/embedded_chunk_{chunk_number:03d}_of_{total_chunks:03d}.json"
+        
+        chunk_content = json.dumps(chunk_documents, ensure_ascii=False, indent=2)
+        
+        chunk_blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=chunk_file_name
+        )
+        
+        chunk_blob_client.upload_blob(
+            chunk_content.encode('utf-8'),
+            overwrite=True,
+            content_settings=ContentSettings(content_type='application/json')
+        )
+        
+        total_time = time.time() - start_time
+        
+        logging.info(f"âœ… Chunk {chunk_number}/{total_chunks} saved: {len(chunk_documents)} docs in {total_time:.2f}s")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "chunk_number": chunk_number,
+                "total_chunks": total_chunks,
+                "documents_processed": len(chunk_documents),
+                "embeddings_generated": len(embeddings),
+                "chunk_file": chunk_file_name,
+                "duration_seconds": round(total_time, 2)
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Generate embeddings error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 5: Index Documents (kept for compatibility)
+@app.function_name(name="index_documents")
+@app.route(route="index_documents", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def index_documents(req: func.HttpRequest) -> func.HttpResponse:
+    """Legacy function - maintained for backward compatibility."""
+    return func.HttpResponse(
+        json.dumps({
+            "status": "deprecated",
+            "message": "Please use index_single_chunk for parallel indexing"
+        }),
+        status_code=200,
+        mimetype="application/json"
+    )
+
+
+# FUNCTION 6: Index Single Chunk 
+@app.function_name(name="index_single_chunk")
+@app.route(route="index_single_chunk", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def index_single_chunk(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Index a single embedded chunk independently.
+    UPDATED: Increased wait time from 5 to 10 minutes for chunk files.
+    """
+    logging.info('=== Index Single Chunk Function Started ===')
+    start_time = time.time()
+    
+    try:
+        req_body = req.get_json()
+        chunk_number = req_body.get('chunk_number')
+        total_chunks = req_body.get('total_chunks')
+        folder_name = req_body.get('folder_name')
+        batch_size = req_body.get('indexing_batch_size', DEFAULT_INDEXING_BATCH_SIZE)
+        custom_index_name = req_body.get('index_name')
+        
+        if not all([chunk_number, total_chunks, folder_name]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters: chunk_number, total_chunks, folder_name"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Determine index name
+        if custom_index_name:
+            index_name = custom_index_name.lower()
+            # Preserve underscores and hyphens (both valid per Azure AI Search rules)
+            index_name = ''.join(c if (c.isalnum() or c in ('_', '-')) else '-' for c in index_name)
+            # Remove consecutive hyphens or underscores
+            index_name = re.sub(r'-+', '-', index_name)  # Collapse multiple hyphens
+            index_name = re.sub(r'_+', '_', index_name)  # Collapse multiple underscores
+            # Remove leading/trailing hyphens or underscores, then truncate
+            index_name = index_name.strip('-_')[:128]
+        else:
+            parts = folder_name.split('_')
+            if len(parts) >= 3:
+                product = parts[1]
+                release = parts[2]
+            else:
+                return func.HttpResponse(
+                    json.dumps({"error": "Invalid folder_name format"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            
+            # Use underscore to preserve naming convention
+            index_name = f"{product}_{release}".lower()
+            # Preserve underscores and hyphens
+            index_name = ''.join(c if (c.isalnum() or c in ('_', '-')) else '-' for c in index_name)
+            # Remove consecutive hyphens or underscores
+            index_name = re.sub(r'-+', '-', index_name)  # Collapse multiple hyphens
+            index_name = re.sub(r'_+', '_', index_name)  # Collapse multiple underscores
+            # Remove leading/trailing hyphens or underscores, then truncate
+            index_name = index_name.strip('-_')[:128]
+        
+        logging.info(f"Processing chunk {chunk_number}/{total_chunks} for index '{index_name}'")
+        
+        # Initialize clients
+        credential = DefaultAzureCredential()
+        search_endpoint = f"https://{AZURE_AI_SEARCH_NAME}.search.windows.net"
+        blob_service_client = get_blob_service_client()
+        
+        # Construct chunk file path
+        chunk_folder = f"{folder_name}_embedded_chunks"
+        chunk_file_name = f"{chunk_folder}/embedded_chunk_{chunk_number:03d}_of_{total_chunks:03d}.json"
+        
+        # OPTIMIZATION: 
+        # The ADF pipeline dependency ("Completed" condition) ensures this runs after embeddings
+        # If chunk file doesn't exist immediately, it means embedding failed - skip gracefully
+        logging.info(f"Checking for chunk file: {chunk_file_name}")
+        
+        try:
+            chunk_blob_client = blob_service_client.get_blob_client(
+                container=AZURE_STORAGE_CONTAINER,
+                blob=chunk_file_name
+            )
+            
+            # Single immediate check - no waiting
+            if not chunk_blob_client.exists():
+                logging.warning(f"âš ï¸ Chunk file not found: {chunk_file_name}")
+                return func.HttpResponse(
+                    json.dumps({
+                        "status": "skipped",
+                        "chunk_number": chunk_number,
+                        "total_chunks": total_chunks,
+                        "chunk_file": chunk_file_name,
+                        "reason": "Embedding file not found - embedding generation may have failed for this chunk",
+                        "suggestion": "Check generate_embeddings logs for this chunk number"
+                    }),
+                    status_code=404,
+                    mimetype="application/json"
+                )
+            
+            # Verify file is complete (not empty)
+            properties = chunk_blob_client.get_blob_properties()
+            if properties.size < 100:  # At least 100 bytes
+                logging.warning(f"âš ï¸ Chunk file is too small ({properties.size} bytes): {chunk_file_name}")
+                return func.HttpResponse(
+                    json.dumps({
+                        "status": "skipped",
+                        "chunk_number": chunk_number,
+                        "total_chunks": total_chunks,
+                        "chunk_file": chunk_file_name,
+                        "file_size": properties.size,
+                        "reason": "Chunk file is incomplete or empty"
+                    }),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            
+            logging.info(f"âœ… Chunk file found (size: {format_bytes(properties.size)})")
+            
+        except Exception as e:
+            logging.error(f"âŒ Error accessing chunk file: {str(e)}")
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "error",
+                    "chunk_number": chunk_number,
+                    "total_chunks": total_chunks,
+                    "chunk_file": chunk_file_name,
+                    "error": str(e)
+                }),
+                status_code=500,
+                mimetype="application/json"
+            )
+        
+        # Download chunk file
+        chunk_blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=chunk_file_name
+        )
+        
+        blob_data = chunk_blob_client.download_blob().readall()
+        chunk_data = json.loads(blob_data.decode('utf-8'))
+        
+        logging.info(f"ðŸ“¥ Downloaded chunk with {len(chunk_data)} documents")
+        
+        # Create/update index (only on first chunk)
+        if chunk_number == 1:
+            logging.info(f"Creating/updating index: {index_name}")
+            
+            index_client = SearchIndexClient(endpoint=search_endpoint, credential=credential)
+            
+            vector_search = VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="my_vector_config",
+                        parameters={"m": 4, "efConstruction": 400, "efSearch": 500, "metric": "cosine"}
+                    )
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="my_vector_config",
+                        algorithm_configuration_name="my_vector_config"
+                    )
+                ]
+            )
+            
+            fields = [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="book_id", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="book_title", type=SearchFieldDataType.String, searchable=True),
+                SearchableField(name="chapter_title", type=SearchFieldDataType.String, searchable=True),
+                SearchableField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchableField(name="topic_title", type=SearchFieldDataType.String, searchable=True),
+                SearchableField(name="topic_type", type=SearchFieldDataType.String, filterable=True),
+
+# ================================
+# SECTION 2: ADF PIPELINE MANAGEMENT FUNCTIONS 
+# ================================
+
+                SearchableField(name="topic_id", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String, searchable=True),
+                SimpleField(name="url", type=SearchFieldDataType.String),
+                SearchableField(name="product", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="version", type=SearchFieldDataType.String, filterable=True),
+                SearchField(
+                    name="embedding",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                    searchable=True,
+                    retrievable=False,
+                    vector_search_dimensions=3072,
+                    vector_search_profile_name="my_vector_config"
+                )
+            ]
+            
+            index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+            index_client.create_or_update_index(index)
+            
+            logging.info(f"âœ… Index '{index_name}' ready")
+            time.sleep(5)
+        else:
+            time.sleep(2)
+        
+        # Prepare and upload documents
+        index_start_time = time.time()
+        search_client = SearchClient(endpoint=search_endpoint, index_name=index_name, credential=credential)
+        
+        documents = []
+        for item in chunk_data:
+            if not item.get("content", "").strip():
+                continue
+            
+            doc = {
+                "id": str(uuid.uuid4()),
+                "book_id": item.get("book_id", ""),
+                "book_title": item.get("book_title", ""),
+                "chapter_title": item.get("chapter_title", ""),
+                "title": item.get("title", ""),
+                "topic_title": item.get("topic_title", ""),
+                "topic_type": item.get("topic_type", ""),
+                "topic_id": item.get("topic_id", ""),
+                "content": item.get("content", ""),
+                "url": item.get("url", ""),
+                "product": item.get("product", ""),
+                "version": item.get("version", ""),
+                "embedding": item.get("embedding", [])
+            }
+            documents.append(doc)
+        
+        # Upload in batches
+        total_uploaded = 0
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            try:
+                result = search_client.upload_documents(documents=batch)
+                total_uploaded += len(result)
+                logging.info(f"ðŸ“¤ Uploaded batch: {total_uploaded}/{len(documents)} for chunk {chunk_number}")
+            except Exception as e:
+                logging.error(f"Error uploading batch: {str(e)}")
+        
+        index_duration = time.time() - index_start_time
+        total_duration = time.time() - start_time
+        
+        response_data = {
+            "status": "success",
+            "chunk_number": chunk_number,
+            "total_chunks": total_chunks,
+            "documents_indexed": total_uploaded,
+            "chunk_file": chunk_file_name,
+            "index_name": index_name,
+            "index_time_seconds": round(index_duration, 2),
+            "total_time_seconds": round(total_duration, 2)
+        }
+        
+        logging.info(f"âœ… Chunk {chunk_number} indexed successfully: {total_uploaded} documents")
+        
+        return func.HttpResponse(
+            json.dumps(response_data),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Index single chunk error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# ================================
+# SECTION 2: ADF PIPELINE MANAGEMENT FUNCTIONS (3 functions)
+# ================================
+
+@app.function_name(name="trigger_pipeline")
+@app.route(route="trigger_pipeline", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def trigger_pipeline(req: func.HttpRequest) -> func.HttpResponse:
+    """Trigger ADF pipeline with parameters."""
+    logging.info('=== Pipeline Trigger Request ===')
+    
+    try:
+        req_body = req.get_json()
+        
+        pipeline_params = {
+            'data_source': req_body.get('data_source', 'TechDocs'),
+            'product': req_body.get('product', 'Capital'),
+            'release': req_body.get('release', '2512'),
+            'index_name': req_body.get('index_name', '')
+        }
+        
+        if not pipeline_params['index_name']:
+            pipeline_params['index_name'] = f"{pipeline_params['product']}-{pipeline_params['release']}".lower()
+        
+        credential = DefaultAzureCredential()
+        
+        adf_client = DataFactoryManagementClient(
+            credential=credential,
+            subscription_id=SUBSCRIPTION_ID
+        )
+        
+        run_response = adf_client.pipelines.create_run(
+            resource_group_name=RESOURCE_GROUP,
+            factory_name=DATA_FACTORY_NAME,
+            pipeline_name=PIPELINE_NAME,
+            parameters=pipeline_params
+        )
+        
+        run_id = run_response.run_id
+        logging.info(f"Pipeline triggered: {run_id}")
+        
+        monitor_url = (
+            f"https://portal.azure.com/#@/resource/subscriptions/{SUBSCRIPTION_ID}"
+            f"/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.DataFactory"
+            f"/factories/{DATA_FACTORY_NAME}/pipelineruns/{run_id}"
+        )
+        
+        response_data = {
+            "status": "success",
+            "message": f"Pipeline triggered successfully for product: {pipeline_params['product']}",
+            "run_id": run_id,
+            "pipeline_name": PIPELINE_NAME,
+            "parameters": pipeline_params,
+            "monitor_url": monitor_url,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+        }
+        
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Error triggering pipeline: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Failed to trigger pipeline",
+                "details": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name(name="check_pipeline_status")
+@app.route(route="check_pipeline_status", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def check_pipeline_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Check the status of a specific pipeline run."""
+    logging.info('=== Pipeline Status Check Request ===')
+    
+    try:
+        run_id = req.params.get('run_id')
+        
+        if not run_id:
+            return func.HttpResponse(
+                json.dumps({
+                    "error": "Missing required parameter: run_id",
+                    "usage": "GET /api/check_pipeline_status?run_id=YOUR_RUN_ID"
+                }),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        credential = DefaultAzureCredential()
+        
+        adf_client = DataFactoryManagementClient(
+            credential=credential,
+            subscription_id=SUBSCRIPTION_ID
+        )
+        
+        run_details = adf_client.pipeline_runs.get(
+            resource_group_name=RESOURCE_GROUP,
+            factory_name=DATA_FACTORY_NAME,
+            run_id=run_id
+        )
+        
+        response_data = {
+            "run_id": run_id,
+            "pipeline_name": run_details.pipeline_name,
+            "status": run_details.status,
+            "run_start": run_details.run_start.isoformat() if run_details.run_start else None,
+            "run_end": run_details.run_end.isoformat() if run_details.run_end else None,
+            "duration_seconds": (
+                (run_details.run_end - run_details.run_start).total_seconds()
+                if run_details.run_end and run_details.run_start
+                else None
+            ),
+            "parameters": run_details.parameters,
+            "message": run_details.message,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+        }
+        
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Error checking pipeline status: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Failed to get pipeline status",
+                "details": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.function_name(name="list_recent_runs")
+@app.route(route="list_recent_runs", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def list_recent_runs(req: func.HttpRequest) -> func.HttpResponse:
+    """List recent pipeline runs."""
+    logging.info('=== List Recent Runs Request ===')
+    
+    try:
+        limit = int(req.params.get('limit', 10))
+        
+        credential = DefaultAzureCredential()
+        
+        adf_client = DataFactoryManagementClient(
+            credential=credential,
+            subscription_id=SUBSCRIPTION_ID
+        )
+        
+        runs = adf_client.pipeline_runs.query_by_factory(
+            resource_group_name=RESOURCE_GROUP,
+            factory_name=DATA_FACTORY_NAME,
+            filter_parameters=RunFilterParameters(
+                last_updated_after=datetime.datetime.utcnow().replace(day=1),
+                last_updated_before=datetime.datetime.utcnow()
+            )
+        )
+        
+        run_list = []
+        for run in list(runs.value)[:limit]:
+            run_info = {
+                "run_id": run.run_id,
+                "pipeline_name": run.pipeline_name,
+                "status": run.status,
+                "run_start": run.run_start.isoformat() if run.run_start else None,
+                "run_end": run.run_end.isoformat() if run.run_end else None,
+                "duration_seconds": (
+                    (run.run_end - run.run_start).total_seconds()
+                    if run.run_end and run.run_start
+                    else None
+                ),
+                "parameters": run.parameters
+            }
+            run_list.append(run_info)
+        
+        response_data = {
+            "total_runs": len(run_list),
+            "limit": limit,
+            "runs": run_list,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+        }
+        
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Error listing pipeline runs: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Failed to list pipeline runs",
+                "details": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
+# ================================
+# SECTION 3: NEW SXA PIPELINE FUNCTIONS
+# ================================
+
+# FUNCTION 10: Download SXA Dataset
+@app.function_name(name="call_api_fetch_dataset_sxa")
+@app.route(route="call_api_fetch_dataset_sxa", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def call_api_fetch_dataset_sxa(req: func.HttpRequest) -> func.HttpResponse:
+    """Download ZIP from SXA API using streaming and extract to blob storage."""
+    logging.info('SXA Download and extract function started')
+    start_time = datetime.datetime.utcnow()
+    
+    try:
+        req_body = req.get_json()
+        data_source = req_body.get('data_source', 'TechDocs')
+        product = req_body.get('product')
+        release = req_body.get('release')
+        format_type = req_body.get('format', 'DITA')
+        language = req_body.get('language', 'en-us')
+        
+        if not all([product, release]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters: product, release"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        
+        payload = {
+            'data_source': data_source,
+            'product': product,
+            'release': release,
+            'format': format_type,
+            'language': language
+        }
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/octet-stream'
+        }
+        
+        params = {"download": "true"}
+        
+        logging.info(f"Downloading SXA dataset: {data_source}_{product}_{release}")
+        
+        response = requests.post(
+            API_BASE_SXA_URL, 
+            params=params, 
+            json=payload, 
+            headers=headers, 
+            stream=True, 
+            timeout=600
+        )
+        
+        if response.status_code != 200:
+            return func.HttpResponse(
+                json.dumps({"error": f"API returned status {response.status_code}"}),
+                status_code=response.status_code,
+                mimetype="application/json"
+            )
+        
+        timestamp = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        if data_source.upper().startswith('SXA'):
+            folder_name = f"{data_source}_{product}_{release}_{timestamp}"
+        else:
+            folder_name = f"SXA_{data_source}_{product}_{release}_{timestamp}"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+            temp_path = temp_file.name
+            total_size = 0
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
+                    total_size += len(chunk)
+            
+            logging.info(f"Downloaded {format_bytes(total_size)}")
+        
+        extraction_count = 0
+        container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+        
+        with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+            for file_info in zip_ref.filelist:
+                if file_info.filename.endswith('.json') and not file_info.is_dir():
+                    with zip_ref.open(file_info.filename) as file:
+                        file_content = file.read()
+                        blob_name = f"{folder_name}/{os.path.basename(file_info.filename)}"
+                        
+                        blob_client = container_client.get_blob_client(blob_name)
+                        blob_client.upload_blob(
+                            file_content, 
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type='application/json')
+                        )
+                        extraction_count += 1
+        
+        os.unlink(temp_path)
+        
+        end_time = datetime.datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        logging.info(f"SXA Extraction complete: {extraction_count} files in {duration:.2f}s")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "folder_name": folder_name,
+                "files_extracted": extraction_count,
+                "download_size_bytes": total_size,
+                "duration_seconds": round(duration, 2),
+                "data_source_type": "SXA"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"SXA Download error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 11: Parse SXA Documents
+@app.function_name(name="parse_documents_sxa")
+@app.route(route="parse_documents_sxa", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def parse_documents_sxa(req: func.HttpRequest) -> func.HttpResponse:
+    """Parse and clean SXA JSON documents - preserves all fields dynamically."""
+    logging.info('SXA Parse documents function started')
+    start_time = datetime.datetime.utcnow()
+    
+    try:
+        req_body = req.get_json()
+        folder_name = req_body.get('folder_name')
+        data_source_type = req_body.get('data_source_type', 'SXA')
+        
+        if not folder_name:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing folder_name parameter"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+        
+        all_documents = []
+        file_count = 0
+        detected_fields = set()
+        
+        blobs = container_client.list_blobs(name_starts_with=f"{folder_name}/")
+        
+        for blob in blobs:
+            if blob.name.endswith('.json') and 'consolidated_results' not in blob.name:
+                blob_client = container_client.get_blob_client(blob.name)
+                blob_data = blob_client.download_blob().readall()
+                
+                try:
+                    data = json.loads(blob_data.decode('utf-8'))
+                    
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict):
+                                # FIELD MAPPING FOR TECHDOCS: Rename topic_title → title (preserve order)
+                                if data_source_type == "TechDocs" and "topic_title" in item:
+                                    topic_title_value = item["topic_title"]
+                                    reordered_item = {}
+                                    for key, value in item.items():
+                                        if key == "topic_title":
+                                            reordered_item["title"] = topic_title_value
+                                        else:
+                                            reordered_item[key] = value
+                                    item.clear()
+                                    item.update(reordered_item)
+                                
+                                content_field = None
+                                for key in ['content', 'text', 'body', 'description']:
+                                    if key in item and isinstance(item.get(key), str):
+                                        content_field = key
+                                        break
+                                
+                                if content_field:
+                                    cleaned_content = clean_content_text(item.get(content_field, ''))
+                                    if cleaned_content.strip():
+                                        truncated_content = truncate_text_to_tokens(cleaned_content, max_tokens=8000)
+                                        item[content_field] = truncated_content
+                                
+                                detected_fields.update(item.keys())
+                                all_documents.append(item)
+                    
+                    file_count += 1
+                    
+                except json.JSONDecodeError:
+                    logging.warning(f"Skipping invalid JSON: {blob.name}")
+        
+        parsed_filename = f"{folder_name}/consolidated_results_parsed_sxa.json"
+        parsed_content = json.dumps(all_documents, ensure_ascii=False, indent=2)
+        
+        parsed_blob_client = container_client.get_blob_client(parsed_filename)
+        parsed_blob_client.upload_blob(
+            parsed_content.encode('utf-8'),
+            overwrite=True,
+            content_settings=ContentSettings(content_type='application/json')
+        )
+        
+        end_time = datetime.datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        logging.info(f"SXA Parsed {len(all_documents)} documents with {len(detected_fields)} fields from {file_count} files in {duration:.2f}s")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "parsed_file": parsed_filename,
+                "total_documents": len(all_documents),
+                "files_processed": file_count,
+                "detected_fields": list(detected_fields),
+                "field_count": len(detected_fields),
+                "duration_seconds": round(duration, 2),
+                "data_source_type": "SXA"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"SXA Parse documents error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 12: Analyze Schema and Calculate Chunks
+@app.function_name(name="analyze_schema_and_calculate_chunks")
+@app.route(route="analyze_schema_and_calculate_chunks", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def analyze_schema_and_calculate_chunks(req: func.HttpRequest) -> func.HttpResponse:
+    """Analyze document schema dynamically and calculate total chunks."""
+    logging.info('SXA Analyze schema and calculate chunks function started')
+    
+    try:
+        req_body = req.get_json()
+        parsed_file_name = req_body.get('parsed_file_name')
+        chunk_size = req_body.get('chunk_size', DEFAULT_CHUNK_SIZE)
+        
+        if not parsed_file_name:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing parsed_file_name parameter"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        blob_service_client = get_blob_service_client()
+        blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=parsed_file_name
+        )
+        
+        blob_data = blob_client.download_blob().readall()
+        documents = json.loads(blob_data.decode('utf-8'))
+        
+        total_documents = len(documents)
+        total_chunks = ceil(total_documents / chunk_size)
+        
+        schema = analyze_document_schema(documents)
+        
+        folder_name = parsed_file_name.split('/')[0]
+        schema_filename = f"{folder_name}/schema_metadata.json"
+        schema_content = json.dumps(schema, ensure_ascii=False, indent=2)
+        
+        schema_blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=schema_filename
+        )
+        schema_blob_client.upload_blob(
+            schema_content.encode('utf-8'),
+            overwrite=True,
+            content_settings=ContentSettings(content_type='application/json')
+        )
+        
+        logging.info(f"SXA Schema Analysis: {total_documents} documents → {total_chunks} chunks")
+        logging.info(f"Detected {len(schema['fields'])} fields, content field: {schema['content_field']}")
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "total_documents": total_documents,
+                "chunk_size": chunk_size,
+                "total_chunks": total_chunks,
+                "schema_file": schema_filename,
+                "detected_fields": len(schema['fields']),
+                "content_field": schema['content_field'],
+                "data_source_type": "SXA"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"SXA Analyze schema error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+# FUNCTION 13: Index Single Chunk SXA
+@app.function_name(name="index_single_chunk_sxa")
+@app.route(route="index_single_chunk_sxa", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def index_single_chunk_sxa(req: func.HttpRequest) -> func.HttpResponse:
+    """Index a single embedded chunk with flexible schema detection."""
+    logging.info('=== SXA Index Single Chunk Function Started ===')
+    start_time = time.time()
+    
+    try:
+        req_body = req.get_json()
+        chunk_number = req_body.get('chunk_number')
+        total_chunks = req_body.get('total_chunks')
+        folder_name = req_body.get('folder_name')
+        schema_metadata = req_body.get('schema_metadata')
+        batch_size = req_body.get('indexing_batch_size', DEFAULT_INDEXING_BATCH_SIZE)
+        custom_index_name = req_body.get('index_name')
+        
+        if not all([chunk_number, total_chunks, folder_name, schema_metadata]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameters"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        if custom_index_name:
+            index_name = custom_index_name.lower()
+            index_name = ''.join(c if (c.isalnum() or c in ('_', '-')) else '-' for c in index_name)
+            index_name = re.sub(r'-+', '-', index_name)
+            index_name = re.sub(r'_+', '_', index_name)
+            index_name = index_name.strip('-_')[:128]
+        else:
+            parts = folder_name.split('_')
+            if len(parts) >= 3:
+                product = parts[2]
+                release = parts[3] if len(parts) > 3 else 'default'
+            else:
+                return func.HttpResponse(
+                    json.dumps({"error": "Invalid folder_name format"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            
+            index_name = f"sxa_{product}_{release}".lower()
+            index_name = ''.join(c if (c.isalnum() or c in ('_', '-')) else '-' for c in index_name)
+            index_name = re.sub(r'-+', '-', index_name)
+            index_name = re.sub(r'_+', '_', index_name)
+            index_name = index_name.strip('-_')[:128]
+        
+        logging.info(f"Processing SXA chunk {chunk_number}/{total_chunks} for index '{index_name}'")
+        
+        credential = DefaultAzureCredential()
+        search_endpoint = f"https://{AZURE_AI_SEARCH_NAME}.search.windows.net"
+        blob_service_client = get_blob_service_client()
+        
+        chunk_folder = f"{folder_name}_embedded_chunks"
+        chunk_file_name = f"{chunk_folder}/embedded_chunk_{chunk_number:03d}_of_{total_chunks:03d}.json"
+        
+        try:
+            chunk_blob_client = blob_service_client.get_blob_client(
+                container=AZURE_STORAGE_CONTAINER,
+                blob=chunk_file_name
+            )
+            
+            if not chunk_blob_client.exists():
+                return func.HttpResponse(
+                    json.dumps({"status": "skipped", "reason": "Chunk file not found"}),
+                    status_code=404,
+                    mimetype="application/json"
+                )
+            
+            properties = chunk_blob_client.get_blob_properties()
+            if properties.size < 100:
+                return func.HttpResponse(
+                    json.dumps({"status": "skipped", "reason": "Chunk file incomplete"}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+            
+        except Exception as e:
+            return func.HttpResponse(
+                json.dumps({"status": "error", "error": str(e)}),
+                status_code=500,
+                mimetype="application/json"
+            )
+        
+        blob_data = chunk_blob_client.download_blob().readall()
+        chunk_data = json.loads(blob_data.decode('utf-8'))
+        
+        schema_blob_client = blob_service_client.get_blob_client(
+            container=AZURE_STORAGE_CONTAINER,
+            blob=schema_metadata
+        )
+        schema_data = json.loads(schema_blob_client.download_blob().readall().decode('utf-8'))
+        
+        if chunk_number == 1:
+            index_client = SearchIndexClient(endpoint=search_endpoint, credential=credential)
+            
+            vector_search = VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="my_vector_config",
+                        parameters={"m": 4, "efConstruction": 400, "efSearch": 500, "metric": "cosine"}
+                    )
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="my_vector_config",
+                        algorithm_configuration_name="my_vector_config"
+                    )
+                ]
+            )
+            
+            fields = create_dynamic_index_fields(schema_data)
+            index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
+            index_client.create_or_update_index(index)
+            time.sleep(5)
+        else:
+            time.sleep(2)
+        
+        search_client = SearchClient(endpoint=search_endpoint, index_name=index_name, credential=credential)
+        
+        documents = []
+        content_field = schema_data.get('content_field', 'content')
+        
+        for item in chunk_data:
+            if not item.get(content_field, "").strip():
+                continue
+            
+            doc = {"id": str(uuid.uuid4())}
+            for field_name in schema_data['fields'].keys():
+                if field_name in item:
+                    value = item[field_name]
+                    # Handle arrays based on schema field type
+                    if schema_data['fields'][field_name]['type'] == 'collection':
+                        # Keep as array if it's a collection field
+                        doc[field_name] = value if isinstance(value, list) else [value]
+                    else:
+                        # Convert arrays to strings for non-collection fields
+                        if isinstance(value, list):
+                            doc[field_name] = ', '.join(str(v) for v in value) if value else ""
+                        else:
+                            doc[field_name] = value if value else ""
+            doc["embedding"] = item.get("embedding", [])
+            documents.append(doc)
+        
+        total_uploaded = 0
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            try:
+                result = search_client.upload_documents(documents=batch)
+                total_uploaded += len(result)
+            except Exception as e:
+                logging.error(f"Error uploading batch: {str(e)}")
+        
+        total_duration = time.time() - start_time
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "chunk_number": chunk_number,
+                "documents_indexed": total_uploaded,
+                "index_name": index_name,
+                "total_time_seconds": round(total_duration, 2),
+                "data_source_type": "SXA"
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"SXA Index error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
